@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Navidrome Playback Handoff
 // @namespace    https://github.com/wouter-intveld/navidrome-playback-handoff
-// @version      0.1.0
+// @version      0.2.0
 // @description  Continue in the Navidrome web UI where another device left off. Needs the playback-handoff server plugin.
 // @homepageURL  https://github.com/wouter-intveld/navidrome-playback-handoff
 // @downloadURL  https://raw.githubusercontent.com/wouter-intveld/navidrome-playback-handoff/main/userscript/navidrome-handoff.user.js
@@ -22,21 +22,21 @@
   if (appAt < 0) return
   const base = location.pathname.slice(0, appAt)
 
-  const memory = JSON.parse(localStorage.getItem(KEY) || '{}')
-  const remember = (patch) => {
-    Object.assign(memory, patch)
-    localStorage.setItem(KEY, JSON.stringify(memory))
-  }
+  // Always read and merge the stored value: another tab, or this page before a
+  // reload, may have written since this script started.
+  const readMemory = () => JSON.parse(localStorage.getItem(KEY) || '{}')
+  const remember = (patch) => localStorage.setItem(KEY, JSON.stringify({ ...readMemory(), ...patch }))
 
   // A restore chosen before the reload is applied now, before the web UI reads
   // its saved queue from localStorage on startup.
   const pending = sessionStorage.getItem(`${KEY}:restore`)
   if (pending) {
     sessionStorage.removeItem(`${KEY}:restore`)
-    const { player, seek } = JSON.parse(pending)
+    const { player, seek, changed } = JSON.parse(pending)
     const state = JSON.parse(localStorage.getItem('state') || '{}')
     state.player = { ...state.player, ...player }
     localStorage.setItem('state', JSON.stringify(state))
+    remember({ handled: changed })
     seekWhenLoaded(seek)
   }
 
@@ -47,7 +47,9 @@
     document.addEventListener(
       type,
       (e) => {
-        if (e.target instanceof HTMLMediaElement) remember({ lastLocalPlay: Date.now() })
+        if (!(e.target instanceof HTMLMediaElement)) return
+        remember({ lastLocalPlay: Date.now() })
+        if (type === 'play') closeBanner()
       },
       true,
     )
@@ -136,15 +138,19 @@
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
   }
 
-  let banner = null
-  let checking = false
-
-  const closeBanner = () => {
-    banner?.remove()
-    banner = null
+  // The server queue to offer, or null when there is nothing to offer: it was
+  // already answered here, or it came from this browser's own playback (the
+  // plugin follows every client, this one included).
+  const latestOffer = async () => {
+    const { playQueue: queue } = await subsonic('getPlayQueue')
+    if (!queue?.current || !queue.entry?.some((e) => e.id === queue.current)) return null
+    const changed = Date.parse(queue.changed)
+    const { handled = 0, lastLocalPlay = 0 } = readMemory()
+    if (changed <= handled || changed <= lastLocalPlay + 15000) return null
+    return { queue, changed }
   }
 
-  const restore = async (queue, changed) => {
+  const restore = async ({ queue, changed }) => {
     const ids = queue.entry.map((e) => e.id)
     const records = await songRecords(ids)
     const items = ids.filter((id) => records.has(id)).map((id) => queueItem(records.get(id)))
@@ -155,20 +161,26 @@
       JSON.stringify({
         player: { queue: items, savedPlayIndex: index },
         seek: { trackId: queue.current, seconds: (queue.position || 0) / 1000 },
+        changed,
       }),
     )
     remember({ handled: changed })
     location.reload()
   }
 
-  const showBanner = (queue, changed) => {
-    const current = queue.entry.find((e) => e.id === queue.current)
-    const position = (queue.position || 0) / 1000
+  let banner = null
+  let checking = false
 
-    banner = document.createElement('div')
-    banner.setAttribute('role', 'dialog')
-    banner.setAttribute('aria-label', 'Continue playback from another device')
-    banner.style.cssText = [
+  function closeBanner() {
+    banner?.root.remove()
+    banner = null
+  }
+
+  const createBanner = () => {
+    const root = document.createElement('div')
+    root.setAttribute('role', 'dialog')
+    root.setAttribute('aria-label', 'Continue playback from another device')
+    root.style.cssText = [
       'position:fixed', 'left:50%', 'bottom:96px', 'transform:translateX(-50%)',
       'z-index:2000', 'display:flex', 'align-items:center', 'gap:12px',
       'max-width:calc(100vw - 32px)', 'padding:12px 16px', 'border-radius:8px',
@@ -180,16 +192,8 @@
     text.style.cssText = 'min-width:0;overflow:hidden'
     const title = document.createElement('div')
     title.style.cssText = 'font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'
-    title.textContent = `Continue "${current.title}"`
     const detail = document.createElement('div')
     detail.style.cssText = 'opacity:.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'
-    detail.textContent = [
-      current.artist,
-      `at ${formatTime(position)}`,
-      queue.entry.length > 1 ? `${queue.entry.length} tracks in queue` : null,
-    ]
-      .filter(Boolean)
-      .join(' · ')
     text.append(title, detail)
 
     const button = (label, primary) => {
@@ -205,38 +209,56 @@
     }
     const continueButton = button('Continue', true)
     const dismissButton = button('Not now', false)
+
+    // Continue restores the server queue as it is now, not what the banner
+    // showed: another device may have moved on since.
     continueButton.addEventListener('click', async () => {
       continueButton.disabled = true
       try {
-        await restore(queue, changed)
+        const offer = await latestOffer()
+        if (offer) await restore(offer)
+        else closeBanner()
       } catch (err) {
         detail.textContent = `Could not restore: ${err.message}`
         continueButton.disabled = false
       }
     })
     dismissButton.addEventListener('click', () => {
-      remember({ handled: changed })
+      remember({ handled: Math.max(banner?.changed || 0, readMemory().handled || 0) })
       closeBanner()
+      check()
     })
 
-    banner.append(text, continueButton, dismissButton)
-    document.body.append(banner)
+    root.append(text, continueButton, dismissButton)
+    document.body.append(root)
+    return { root, title, detail, changed: 0 }
   }
 
-  // Offer the server queue when another device changed it after this browser
-  // last played or answered an offer.
+  const showOffer = ({ queue, changed }) => {
+    const current = queue.entry.find((e) => e.id === queue.current)
+    banner ??= createBanner()
+    banner.changed = changed
+    banner.title.textContent = `Continue "${current.title}"`
+    banner.detail.textContent = [
+      current.artist,
+      `at ${formatTime((queue.position || 0) / 1000)}`,
+      queue.entry.length > 1 ? `${queue.entry.length} tracks in queue` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ')
+  }
+
+  // Keep the banner in step with the server queue: show the newest handoff,
+  // update it while the other device plays on, and drop it when it no longer
+  // applies.
   const check = async () => {
-    if (checking || banner || document.hidden || !credentials() || isPlayingHere()) return
+    if (checking || document.hidden || !credentials()) return
+    if (isPlayingHere()) return closeBanner()
     checking = true
     try {
-      const { playQueue: queue } = await subsonic('getPlayQueue')
-      if (!queue?.current || !queue.entry?.length) return
-      const changed = Date.parse(queue.changed)
-      if (changed <= (memory.handled || 0)) return
-      // This browser's own playback also updates the server queue (the plugin
-      // follows every client), so ignore changes made while it was playing.
-      if (changed <= (memory.lastLocalPlay || 0) + 15000) return
-      showBanner(queue, changed)
+      const offer = await latestOffer()
+      if (offer && !isPlayingHere()) showOffer(offer)
+      else closeBanner()
     } catch (err) {
       console.warn('[playback-handoff]', err)
     } finally {
@@ -247,7 +269,7 @@
   const start = () => {
     check()
     document.addEventListener('visibilitychange', check)
-    setInterval(check, 30000)
+    setInterval(check, 15000)
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start)
