@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/navidrome/navidrome/master/plugins/manifest-schema.json",
+  "name": "Playback Handoff",
+  "author": "Wouter",
+  "version": "0.1.0",
+  "description": "Spotify-style 'continue on another device': mirrors what each user is playing, on any client, into their server play queue so the next client resumes at the same track and position.",
+  "config": {
+    "schema": {
+      "type": "object",
+      "properties": {
+        "refreshSeconds": {
+          "type": "integer",
+          "title": "Position refresh interval (seconds)",
+          "description": "While a track plays, how often the saved position is moved forward. Lower is more precise for clients that only report track starts.",
+          "default": 10,
+          "minimum": 5,
+          "maximum": 300
+        }
+      }
+    }
+  },
+  "permissions": {
+    "users": {
+      "reason": "Receive playback events for the users assigned to this plugin"
+    },
+    "subsonicapi": {
+      "reason": "Read and save each user's play queue (getPlayQueueByIndex / savePlayQueueByIndex)"
+    },
+    "scheduler": {
+      "reason": "Periodically advance the saved position while a track is playing"
+    },
+    "cache": {
+      "reason": "Remember the last playback report per user"
+    }
+  }
+}
