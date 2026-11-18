@@ -19,6 +19,9 @@ type fakeHost struct {
 	queueJSON string
 	saves     []url.Values
 	ticking   map[string]string
+	songAlbum map[string]string
+	albums    map[string][]string
+	lookups   int
 }
 
 func newFakeHost(t *testing.T) *fakeHost {
@@ -27,12 +30,16 @@ func newFakeHost(t *testing.T) *fakeHost {
 		cache:     map[string]string{},
 		queueJSON: `{"subsonic-response":{"status":"ok","playQueueByIndex":{"username":"alice"}}}`,
 		ticking:   map[string]string{},
+		songAlbum: map[string]string{},
+		albums:    map[string][]string{},
 	}
 	for _, m := range []*mock.Mock{&host.CacheMock.Mock, &host.SchedulerMock.Mock, &host.ConfigMock.Mock, &host.SubsonicAPIMock.Mock} {
 		m.ExpectedCalls, m.Calls = nil, nil
 	}
 	pdk.ResetMock()
 	pdk.PDKMock.On("Log", mock.Anything, mock.Anything).Return()
+	f.songAlbum["t2"] = "al"
+	f.albums["al"] = []string{"t1", "t2", "t3"}
 
 	host.CacheMock.On("SetString", mock.Anything, mock.Anything, mock.Anything).Return(nil).Run(func(a mock.Arguments) {
 		f.cache[a.String(0)] = a.String(1)
@@ -64,6 +71,21 @@ func newFakeHost(t *testing.T) *fakeHost {
 			}
 			f.saves = append(f.saves, q)
 			return mock.Arguments{`{"subsonic-response":{"status":"ok"}}`, nil}
+		case "getSong":
+			f.lookups++
+			q, _ := url.ParseQuery(query)
+			albumID, ok := f.songAlbum[q.Get("id")]
+			if !ok {
+				return mock.Arguments{`{"subsonic-response":{"status":"failed","error":{"code":70,"message":"not found"}}}`, nil}
+			}
+			return mock.Arguments{`{"subsonic-response":{"status":"ok","song":{"id":"` + q.Get("id") + `","albumId":"` + albumID + `"}}}`, nil}
+		case "getAlbum":
+			q, _ := url.ParseQuery(query)
+			var songs []string
+			for _, id := range f.albums[q.Get("id")] {
+				songs = append(songs, `{"id":"`+id+`"}`)
+			}
+			return mock.Arguments{`{"subsonic-response":{"status":"ok","album":{"song":[` + strings.Join(songs, ",") + `]}}}`, nil}
 		}
 		return mock.Arguments{"", errors.New("unexpected call " + uri)}
 	})
@@ -218,25 +240,64 @@ func TestSubsonicFailureIsReported(t *testing.T) {
 	assert.Empty(t, f.saves)
 }
 
-func TestPlaceInQueue(t *testing.T) {
+func TestNextTrackOfAlbumExpandsQueueToAlbum(t *testing.T) {
+	f := newFakeHost(t)
+	f.queueJSON = `{"subsonic-response":{"status":"ok","playQueueByIndex":{"entry":[{"id":"t1"}],"currentIndex":0}}}`
+
+	require.NoError(t, handleReport(report("playing", 0), 0))
+
+	save := f.lastSave(t)
+	assert.Equal(t, []string{"t1", "t2", "t3"}, save["id"])
+	assert.Equal(t, "1", save.Get("currentIndex"))
+}
+
+func TestTrackNotFollowingPreviousOneStaysSingle(t *testing.T) {
+	f := newFakeHost(t)
+	f.queueJSON = `{"subsonic-response":{"status":"ok","playQueueByIndex":{"entry":[{"id":"t3"}],"currentIndex":0}}}`
+
+	require.NoError(t, handleReport(report("playing", 0), 0))
+
+	assert.Equal(t, []string{"t2"}, f.lastSave(t)["id"])
+}
+
+func TestFirstTrackWithoutPreviousSkipsAlbumLookup(t *testing.T) {
+	f := newFakeHost(t)
+
+	require.NoError(t, handleReport(report("playing", 0), 0))
+
+	assert.Equal(t, []string{"t2"}, f.lastSave(t)["id"])
+	assert.Zero(t, f.lookups)
+}
+
+func TestAlbumLookupFailureStillSavesTrack(t *testing.T) {
+	f := newFakeHost(t)
+	f.queueJSON = `{"subsonic-response":{"status":"ok","playQueueByIndex":{"entry":[{"id":"t1"}],"currentIndex":0}}}`
+	delete(f.songAlbum, "t2")
+
+	require.NoError(t, handleReport(report("playing", 0), 0))
+
+	assert.Equal(t, []string{"t2"}, f.lastSave(t)["id"])
+}
+
+func TestIndexInQueue(t *testing.T) {
 	cases := []struct {
 		name      string
 		ids       []string
 		current   int
-		wantIDs   []string
 		wantIndex int
+		wantFound bool
 	}{
-		{"current entry", []string{"a", "t", "b"}, 1, []string{"a", "t", "b"}, 1},
-		{"next occurrence after current", []string{"t", "a", "t"}, 1, []string{"t", "a", "t"}, 2},
-		{"earlier occurrence", []string{"t", "a", "b"}, 2, []string{"t", "a", "b"}, 0},
-		{"not in queue", []string{"a", "b"}, 0, []string{"t"}, 0},
-		{"empty queue", nil, 0, []string{"t"}, 0},
+		{"current entry", []string{"a", "t", "b"}, 1, 1, true},
+		{"next occurrence after current", []string{"t", "a", "t"}, 1, 2, true},
+		{"earlier occurrence", []string{"t", "a", "b"}, 2, 0, true},
+		{"not in queue", []string{"a", "b"}, 0, 0, false},
+		{"empty queue", nil, 0, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			ids, idx := placeInQueue(c.ids, c.current, "t")
-			assert.Equal(t, c.wantIDs, ids)
+			idx, found := indexInQueue(c.ids, c.current, "t")
 			assert.Equal(t, c.wantIndex, idx)
+			assert.Equal(t, c.wantFound, found)
 		})
 	}
 }

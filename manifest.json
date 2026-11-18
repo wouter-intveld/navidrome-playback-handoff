@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/navidrome/navidrome/master/plugins/manifest-schema.json",
   "name": "Playback Handoff",
   "author": "Wouter",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Spotify-style 'continue on another device': mirrors what each user is playing, on any client, into their server play queue so the next client resumes at the same track and position.",
   "config": {
     "schema": {
@@ -24,7 +24,7 @@
       "reason": "Receive playback events for the users assigned to this plugin"
     },
     "subsonicapi": {
-      "reason": "Read and save each user's play queue (getPlayQueueByIndex / savePlayQueueByIndex)"
+      "reason": "Read and save each user's play queue, and look up a track's album to rebuild album queues"
     },
     "scheduler": {
       "reason": "Periodically advance the saved position while a track is playing"

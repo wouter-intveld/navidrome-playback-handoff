@@ -177,6 +177,14 @@ type subsonicResponse struct {
 			} `json:"entry"`
 			CurrentIndex *int `json:"currentIndex"`
 		} `json:"playQueueByIndex"`
+		Song *struct {
+			AlbumID string `json:"albumId"`
+		} `json:"song"`
+		Album *struct {
+			Song []struct {
+				ID string `json:"id"`
+			} `json:"song"`
+		} `json:"album"`
 	} `json:"subsonic-response"`
 }
 
@@ -199,7 +207,7 @@ func callSubsonic(uri string) (subsonicResponse, error) {
 }
 
 // saveQueue points the user's server play queue at trackID/positionMs, keeping
-// the existing queue when it contains the track.
+// the existing queue when it contains the track and otherwise building a new one.
 func saveQueue(user, trackID string, positionMs int64) error {
 	resp, err := callSubsonic("getPlayQueueByIndex?u=" + url.QueryEscape(user))
 	if err != nil {
@@ -215,7 +223,15 @@ func saveQueue(user, trackID string, positionMs int64) error {
 			current = *pq.CurrentIndex
 		}
 	}
-	ids, current = placeInQueue(ids, current, trackID)
+	if i, ok := indexInQueue(ids, current, trackID); ok {
+		current = i
+	} else {
+		var previous string
+		if current >= 0 && current < len(ids) {
+			previous = ids[current]
+		}
+		ids, current = newQueue(user, previous, trackID)
+	}
 
 	q := url.Values{}
 	q.Set("u", user)
@@ -228,23 +244,72 @@ func saveQueue(user, trackID string, positionMs int64) error {
 	return nil
 }
 
-// placeInQueue returns the queue and index to save for trackID. It prefers the
-// current entry, then the next occurrence after it (the player advanced), then
-// any occurrence; a track outside the queue replaces it, since the device that
-// is playing it never shared its queue.
-func placeInQueue(ids []string, current int, trackID string) ([]string, int) {
+// indexInQueue finds trackID in the saved queue, preferring the current entry,
+// then the next occurrence after it (the player advanced), then any occurrence.
+func indexInQueue(ids []string, current int, trackID string) (int, bool) {
 	if current >= 0 && current < len(ids) && ids[current] == trackID {
-		return ids, current
+		return current, true
 	}
 	for i := max(current+1, 0); i < len(ids); i++ {
 		if ids[i] == trackID {
-			return ids, i
+			return i, true
 		}
 	}
 	for i, id := range ids {
 		if id == trackID {
-			return ids, i
+			return i, true
 		}
 	}
-	return []string{trackID}, 0
+	return 0, false
+}
+
+// newQueue builds the queue for a track the saved queue doesn't contain. The
+// playing device never shared its queue, so the plugin infers one: when the
+// track directly follows the previously playing track on its album, the user is
+// playing through that album and the queue becomes the whole album. Anything
+// else (playlists, shuffle, a single pick) gets a single-track queue rather
+// than a wrong guess.
+func newQueue(user, previousID, trackID string) ([]string, int) {
+	single := []string{trackID}
+	if previousID == "" {
+		return single, 0
+	}
+	album, err := albumTracks(user, trackID)
+	if err != nil {
+		pdk.Log(pdk.LogWarn, fmt.Sprintf("handoff: album lookup for %s failed, saving single track: %v", trackID, err))
+		return single, 0
+	}
+	for i, id := range album {
+		if id == trackID {
+			if i > 0 && album[i-1] == previousID {
+				return album, i
+			}
+			break
+		}
+	}
+	return single, 0
+}
+
+// albumTracks returns the track IDs of trackID's album in album order.
+func albumTracks(user, trackID string) ([]string, error) {
+	u := url.QueryEscape(user)
+	song, err := callSubsonic("getSong?u=" + u + "&id=" + url.QueryEscape(trackID))
+	if err != nil {
+		return nil, err
+	}
+	if song.Response.Song == nil || song.Response.Song.AlbumID == "" {
+		return nil, errors.New("track has no album")
+	}
+	album, err := callSubsonic("getAlbum?u=" + u + "&id=" + url.QueryEscape(song.Response.Song.AlbumID))
+	if err != nil {
+		return nil, err
+	}
+	if album.Response.Album == nil {
+		return nil, errors.New("album not found")
+	}
+	ids := make([]string, 0, len(album.Response.Album.Song))
+	for _, s := range album.Response.Album.Song {
+		ids = append(ids, s.ID)
+	}
+	return ids, nil
 }
